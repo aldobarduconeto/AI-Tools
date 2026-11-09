@@ -1,0 +1,25 @@
+platform :ios, '15.0'
+ENV['COCOAPODS_DISABLE_STATS'] = 'true'
+
+project 'Runner', 'Debug' => :debug, 'Profile' => :release, 'Release' => :release
+
+config = File.join(__dir__, 'Flutter', 'Generated.xcconfig')
+flutter_root = File.read(config)[/^FLUTTER_ROOT=(.+)$/, 1]&.strip
+raise 'Run flutter pub get before installing pods' unless flutter_root
+require File.join(flutter_root, 'packages', 'flutter_tools', 'bin', 'podhelper')
+require_relative '../tool/prepare_lame_pod'
+
+flutter_ios_podfile_setup
+prepare_lame_pod('ios')
+
+target 'Runner' do
+  use_frameworks!
+  flutter_install_all_ios_pods __dir__
+  target 'RunnerTests' do
+    inherit! :search_paths
+  end
+end
+
+post_install do |installer|
+  installer.pods_project.targets.each { |target| flutter_additional_ios_build_settings(target) }
+end

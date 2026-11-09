@@ -1,0 +1,259 @@
+name: AI Tools - Build e Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag existente para compilar e publicar (ex. v1.0.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: '3.47.9'
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validar tag e fixar commit
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Use uma tag no formato v1.2.3."
+            exit 1
+          fi
+          git fetch origin "refs/tags/$RELEASE_TAG"
+          commit="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
+          {
+            echo "tag=$RELEASE_TAG"
+            echo "version=${RELEASE_TAG#v}"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: android
+            runner: ubuntu-24.04
+          - target: linux
+            runner: ubuntu-24.04
+          - target: windows
+            runner: windows-2025
+          - target: apple
+            runner: macos-26
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+
+      - name: Configurar Java
+        if: matrix.target == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar dependências de compilação Linux
+        if: matrix.target == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev \
+            liblzma-dev liblldb-dev libavformat-dev libavcodec-dev libavutil-dev \
+            libswscale-dev libjpeg-dev
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - run: flutter pub get
+
+      - name: Analisar o código
+        if: matrix.target == 'linux'
+        run: flutter analyze --no-pub
+
+      - name: Gerar APK Android ARM64
+        if: matrix.target == 'android'
+        run: |
+          flutter build apk --release --target-platform android-arm64 --build-name "$RELEASE_VERSION"
+          mkdir -p release-assets
+          cp build/app/outputs/flutter-apk/app-release.apk release-assets/AI-Tools-Android-arm64.apk
+
+      - name: Gerar pacote Debian amd64
+        if: matrix.target == 'linux'
+        shell: bash
+        run: |
+          flutter build linux --release --build-name "$RELEASE_VERSION"
+          dpkg --validate-version "$RELEASE_VERSION"
+          bundle=build/linux/x64/release/bundle
+          test -x "$bundle/ai_tools"
+          staging="$(mktemp -d)"
+          trap 'rm -rf -- "$staging"' EXIT
+          install -d "$staging"/{DEBIAN,usr/bin,usr/lib/ai-tools,usr/share/applications}
+          cp -a "$bundle/." "$staging/usr/lib/ai-tools/"
+          ln -s /usr/lib/ai-tools/ai_tools "$staging/usr/bin/ai-tools"
+          install -Dm644 assets/branding/app_icon.png "$staging/usr/share/pixmaps/ai-tools.png"
+          cat > "$staging/DEBIAN/control" <<EOF
+          Package: ai-tools
+          Version: $RELEASE_VERSION
+          Architecture: amd64
+          Maintainer: AI Tools <${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com>
+          Homepage: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          Section: utils
+          Priority: optional
+          Depends: libc6, libgcc-s1, libstdc++6, libgtk-3-0t64, libavformat60, libavcodec60, libavutil58, libswscale7, libjpeg-turbo8, ffmpeg, espeak-ng
+          Description: Ferramentas locais de IA e mídia com Gemma
+          EOF
+          cat > "$staging/usr/share/applications/ai-tools.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=AI Tools
+          Exec=ai-tools
+          Icon=ai-tools
+          Terminal=false
+          Categories=Utility;
+          EOF
+          mkdir -p release-assets
+          dpkg-deb --root-owner-group --build "$staging" release-assets/AI-Tools-Linux-amd64.deb
+          dpkg-deb --info release-assets/AI-Tools-Linux-amd64.deb
+
+      - name: Compilar Windows e gerar instalador Inno Setup
+        if: matrix.target == 'windows'
+        shell: pwsh
+        run: |
+          flutter build windows --release --build-name $env:RELEASE_VERSION
+          if ($LASTEXITCODE -ne 0) { throw 'O build do Windows falhou.' }
+          $bundle = (Resolve-Path 'build/windows/x64/runner/Release').Path
+          if (!(Test-Path -LiteralPath (Join-Path $bundle 'ai_tools.exe'))) {
+            throw 'Executável ai_tools.exe ausente.'
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio com ferramentas C++ ausente.' }
+          $crt = Get-ChildItem -Directory (Join-Path $vs 'VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT') |
+            Sort-Object { [version]$_.Parent.Parent.Name } -Descending | Select-Object -First 1
+          if (!$crt) { throw 'Bibliotecas redistribuíveis do Visual C++ ausentes.' }
+          Copy-Item (Join-Path $crt.FullName '*.dll') -Destination $bundle
+
+          $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (!$iscc) {
+            $compilerPaths = @(
+              (Join-Path $env:ProgramFiles 'Inno Setup/ISCC.exe')
+              (Join-Path $env:ProgramFiles 'Inno Setup 7/ISCC.exe')
+              (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 7/ISCC.exe')
+              (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe')
+            )
+            $iscc = $compilerPaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            if (!$iscc) {
+              choco install innosetup --yes --no-progress
+              if ($LASTEXITCODE -ne 0) { throw 'A instalação do Inno Setup falhou.' }
+              $iscc = $compilerPaths | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+            }
+          }
+          if (!$iscc) { throw 'Compilador ISCC.exe ausente.' }
+          $output = (New-Item -ItemType Directory -Force release-assets).FullName
+          & $iscc "-dReleaseVersion=$env:RELEASE_VERSION" "-dBundleDir=$bundle" "/O$output" 'windows/installer/ai_tools.iss'
+          if ($LASTEXITCODE -ne 0) { throw 'A geração do instalador falhou.' }
+
+      - name: Gerar DMG e IPA
+        if: matrix.target == 'apple'
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          staging="$(mktemp -d)"
+          trap 'rm -rf -- "$staging"' EXIT
+
+          flutter build macos --release --build-name "$RELEASE_VERSION"
+          mkdir -p "$staging/dmg"
+          ditto build/macos/Build/Products/Release/ai_tools.app "$staging/dmg/AI Tools.app"
+          ln -s /Applications "$staging/dmg/Applications"
+          hdiutil create -volname 'AI Tools' -srcfolder "$staging/dmg" -format UDZO \
+            release-assets/AI-Tools-macOS.dmg
+          hdiutil verify release-assets/AI-Tools-macOS.dmg
+
+          flutter build ios --release --no-codesign --build-name "$RELEASE_VERSION"
+          mkdir -p "$staging/ipa/Payload"
+          ditto build/ios/iphoneos/Runner.app "$staging/ipa/Payload/Runner.app"
+          ditto -c -k --keepParent "$staging/ipa/Payload" release-assets/AI-Tools-iOS-unsigned.ipa
+          unzip -Z1 release-assets/AI-Tools-iOS-unsigned.ipa | grep -x 'Payload/Runner.app/Info.plist'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-tools-${{ matrix.target }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ai-tools-*
+          path: release-assets
+          merge-multiple: true
+      - name: Validar e publicar os cinco pacotes
+        shell: bash
+        run: |
+          files=(
+            release-assets/AI-Tools-Android-arm64.apk
+            release-assets/AI-Tools-Linux-amd64.deb
+            release-assets/AI-Tools-Windows-x64-Setup.exe
+            release-assets/AI-Tools-macOS.dmg
+            release-assets/AI-Tools-iOS-unsigned.ipa
+          )
+          for file in "${files[@]}"; do
+            test -s "$file" || { echo "::error::Artefato ausente ou vazio: $file"; exit 1; }
+          done
+          (
+            cd release-assets
+            sha256sum AI-Tools-* > SHA256SUMS.txt
+          )
+          files+=(release-assets/SHA256SUMS.txt)
+          repo="$GITHUB_REPOSITORY"
+          if draft="$(gh release view "$RELEASE_TAG" --repo "$repo" --json isDraft --jq .isDraft)"; then
+            if [[ "$draft" != true ]]; then
+              echo "::error::Esta versão já foi publicada. Use uma nova tag."
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" "${files[@]}" --repo "$repo" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${files[@]}" --repo "$repo" --verify-tag --draft \
+              --title "AI Tools $RELEASE_TAG" --generate-notes \
+              --notes 'IPA sem assinatura. O APK usa a assinatura de depuração definida no projeto. No Windows e no macOS, FFmpeg no PATH é necessário para os recursos de áudio comprimido e exportação MP4.'
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$repo" --draft=false
